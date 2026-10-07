@@ -75,7 +75,6 @@ def generate_template_features(
     for _ in seq: confidence_scores.append( 9 )
 
     for idx, i in enumerate(seq):
-
         if not residue_mask[ idx ]: continue
 
         templates_all_atom_positions[ idx ] = all_atom_positions[ idx ][0] # assign target indices to template coordinates

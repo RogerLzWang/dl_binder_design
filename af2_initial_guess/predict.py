@@ -23,6 +23,7 @@ from alphafold.model import config
 from alphafold.model import model
 
 import af2_util
+import af2_scores
 
 parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parent, 'include'))
@@ -57,6 +58,10 @@ parser.add_argument( "-max_amide_dist", type=float, default=3.0, help='The maxim
 parser.add_argument( "-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)' )
 parser.add_argument( "-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)' )
 parser.add_argument( "-force_monomer", action="store_true", default=False, help='When active, the model will predict the structure of a monomer (default: False)' )
+parser.add_argument( "-save_pae_matrix", action="store_true", default=False, help='Save the expected PAE matrix in a compressed NPZ file (default: False)' )
+parser.add_argument( "-save_pae_logits", action="store_true", default=False, help='Save the 64-bin PAE logits in a compressed NPZ file (default: False)' )
+parser.add_argument( "-pae_output_dir", type=str, default="pae_outputs", help='Directory for saved PAE NPZ files (default: pae_outputs)' )
+parser.add_argument( "-ipsae_pae_cutoff", type=float, default=10.0, help='PAE cutoff in Angstroms used to calculate ipSAE (default: 10.0)' )
 
 args = parser.parse_args()
 
@@ -91,6 +96,10 @@ class AF2_runner():
     def __init__(self, args, struct_manager):
 
         self.max_amide_dist = args.max_amide_dist
+        self.save_pae_matrix = args.save_pae_matrix
+        self.save_pae_logits = args.save_pae_logits
+        self.pae_output_dir = args.pae_output_dir
+        self.ipsae_pae_cutoff = args.ipsae_pae_cutoff
 
         # For timing
         self.t0 = None
@@ -165,7 +174,7 @@ class AF2_runner():
 
         return feature_dict, initial_guess 
 
-    def generate_scoredict(self, feat_holder, confidences, rmsds) -> None:
+    def generate_scoredict(self, feat_holder, confidences, rmsds, af2_score_dict) -> None:
         '''
         Collect the confidence values, slicing them to the binder and target regions
         then add the parsed scores to the score_dict
@@ -209,6 +218,7 @@ class AF2_runner():
                 "target_aligned_rmsd": rmsds['target_aligned_rmsd'],
                 "time" : time
         }
+        score_dict.update(af2_score_dict)
 
         # Store this in the feature holder for later use
         feat_holder.score_dict = score_dict
@@ -247,6 +257,27 @@ class AF2_runner():
         
         feat_holder.plddt_array = confidences['plddt']
 
+        if self.save_pae_matrix or self.save_pae_logits:
+            os.makedirs(self.pae_output_dir, exist_ok=True)
+            pae_output = {
+                'pae_breaks': np.asarray(
+                    prediction_result['predicted_aligned_error']['breaks'],
+                    dtype=np.float32),
+                'plddt': np.asarray(confidences['plddt'], dtype=np.float32),
+                'binder_length': np.asarray(feat_holder.binderlen, dtype=np.int32),
+            }
+            if self.save_pae_matrix:
+                pae_output['pae'] = np.asarray(
+                    confidences['predicted_aligned_error'], dtype=np.float32)
+            if self.save_pae_logits:
+                pae_output['pae_logits'] = np.asarray(
+                    prediction_result['predicted_aligned_error']['logits'],
+                    dtype=np.float32)
+
+            pae_filename = os.path.join(
+                self.pae_output_dir, feat_holder.outtag + '_pae.npz')
+            np.savez_compressed(pae_filename, **pae_output)
+
         # Calculate the RMSDs
         target_mask = np.zeros(len(feat_holder.seq), dtype=bool)
         target_mask[feat_holder.binderlen:] = True
@@ -256,6 +287,22 @@ class AF2_runner():
             this_protein.atom_positions,
             target_mask
         )
+
+        if feat_holder.monomer:
+            af2_score_dict = {
+                'ipsae': float('nan'),
+                'pdockq': float('nan'),
+                'pdockq2': float('nan'),
+            }
+        else:
+            af2_score_dict = af2_scores.calculate_scores(
+                pae=confidences['predicted_aligned_error'],
+                plddt=confidences['plddt'],
+                atom_positions=this_protein.atom_positions,
+                atom_mask=this_protein.atom_mask,
+                binder_length=feat_holder.binderlen,
+                ipsae_pae_cutoff=self.ipsae_pae_cutoff,
+            )
 
         # Write the structure as a pdb file so Rosetta can read it
         unrelaxed_pdb_lines = protein.to_pdb(this_protein)
@@ -268,7 +315,8 @@ class AF2_runner():
         os.remove(self.struct_manager.tmp_fn)
         
         # Now we can finally write the scores and the predicted structure to disk
-        self.generate_scoredict(feat_holder, confidences, rmsds)
+        self.generate_scoredict(
+            feat_holder, confidences, rmsds, af2_score_dict)
         self.struct_manager.dump_pose(feat_holder)
     
     def process_struct(self, tag) -> None:
